@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
+import * as XLSX from 'xlsx';
 import { db } from '../firebase';
-import { collection, onSnapshot, addDoc, serverTimestamp, deleteDoc, doc } from 'firebase/firestore';
-import { GraduationCap, Trash2, CheckCircle, XCircle, Clock, Send } from 'lucide-react';
+import { collection, onSnapshot, addDoc, serverTimestamp, deleteDoc, doc, writeBatch } from 'firebase/firestore';
+import { GraduationCap, Trash2, CheckCircle, XCircle, Clock, Send, Upload, FileSpreadsheet } from 'lucide-react';
 
 const Marks = () => {
   const [marks, setMarks] = useState([]);
@@ -12,6 +13,10 @@ const Marks = () => {
     examType: '',
     score: ''
   });
+  const [excelRows, setExcelRows] = useState([]);
+  const [excelError, setExcelError] = useState('');
+  const [excelFileName, setExcelFileName] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
 
   // Fetch Students (for the dropdown) and Marks (for the table)
   useEffect(() => {
@@ -57,6 +62,97 @@ const Marks = () => {
   const handleDelete = async (markId) => {
     if (window.confirm('Are you sure you want to delete this record?')) {
       await deleteDoc(doc(db, 'marks', markId));
+    }
+  };
+
+  const getValue = (row, keys) => {
+    const normalizedRow = Object.entries(row).reduce((acc, [key, value]) => {
+      const normalizedKey = key.toString().toLowerCase().replace(/[\s_-]/g, '');
+      acc[normalizedKey] = value;
+      return acc;
+    }, {});
+
+    for (const key of keys) {
+      const value = normalizedRow[key];
+      if (value !== undefined && value !== null && value.toString().trim() !== '') {
+        return value.toString().trim();
+      }
+    }
+
+    return '';
+  };
+
+  const normalizeExcelRow = (row) => ({
+    rollNumber: getValue(row, ['rollnumber', 'rollno', 'roll', 'studentid', 'student']),
+    examType: getValue(row, ['examtype', 'exam', 'testtype', 'assessment']),
+    subject: getValue(row, ['subject', 'course']),
+    score: getValue(row, ['score', 'marks', 'mark', 'grade']),
+  });
+
+  const handleExcelChange = (event) => {
+    const file = event.target.files?.[0];
+    setExcelRows([]);
+    setExcelError('');
+    setExcelFileName(file?.name || '');
+
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (loadEvent) => {
+      try {
+        const workbook = XLSX.read(loadEvent.target.result, { type: 'array' });
+        const firstSheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[firstSheetName];
+        const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+        const normalizedRows = rows.map(normalizeExcelRow);
+        const validRows = normalizedRows.filter((row) =>
+          row.rollNumber && row.examType && row.subject && row.score
+        );
+
+        if (validRows.length === 0) {
+          setExcelError('No valid rows found. Use columns: rollNumber, examType, subject, score.');
+          return;
+        }
+
+        setExcelRows(validRows);
+        if (validRows.length !== rows.length) {
+          setExcelError(`${rows.length - validRows.length} row(s) were skipped because required values were missing.`);
+        }
+      } catch (error) {
+        console.error('Error reading Excel file:', error);
+        setExcelError('Could not read this file. Please upload a valid Excel or CSV file.');
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const handleImportExcel = async () => {
+    if (excelRows.length === 0) return;
+
+    setIsImporting(true);
+    try {
+      for (let index = 0; index < excelRows.length; index += 450) {
+        const batch = writeBatch(db);
+        excelRows.slice(index, index + 450).forEach((row) => {
+          const markRef = doc(collection(db, 'marks'));
+          batch.set(markRef, {
+            ...row,
+            status: 'pending',
+            reason: '',
+            createdAt: serverTimestamp()
+          });
+        });
+        await batch.commit();
+      }
+
+      alert(`${excelRows.length} mark record(s) imported successfully.`);
+      setExcelRows([]);
+      setExcelFileName('');
+      setExcelError('');
+    } catch (error) {
+      alert('Error importing Excel rows: ' + error.message);
+    } finally {
+      setIsImporting(false);
     }
   };
 
@@ -127,6 +223,70 @@ const Marks = () => {
               <Send size={18} /> Publish Marks
             </button>
           </form>
+
+          <div className="mt-6 pt-6 border-t border-slate-200">
+            <h3 className="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2">
+              <FileSpreadsheet size={18} className="text-green-600" />
+              Import from Excel
+            </h3>
+            <label className="flex flex-col items-center justify-center gap-2 border-2 border-dashed border-slate-300 rounded-xl p-5 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition-colors">
+              <Upload size={24} className="text-slate-500" />
+              <span className="text-sm font-medium text-slate-700">
+                {excelFileName || 'Choose .xlsx, .xls, or .csv file'}
+              </span>
+              <input
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                className="hidden"
+                onChange={handleExcelChange}
+              />
+            </label>
+            <p className="mt-2 text-xs text-slate-500">
+              Columns: rollNumber, examType, subject, score
+            </p>
+
+            {excelError && (
+              <p className="mt-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3">
+                {excelError}
+              </p>
+            )}
+
+            {excelRows.length > 0 && (
+              <div className="mt-4 space-y-3">
+                <div className="border border-slate-200 rounded-lg overflow-hidden">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 text-slate-600">
+                      <tr>
+                        <th className="p-2">Roll</th>
+                        <th className="p-2">Exam</th>
+                        <th className="p-2">Subject</th>
+                        <th className="p-2">Score</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {excelRows.slice(0, 5).map((row, index) => (
+                        <tr key={`${row.rollNumber}-${row.subject}-${index}`}>
+                          <td className="p-2 font-medium">{row.rollNumber}</td>
+                          <td className="p-2">{row.examType}</td>
+                          <td className="p-2">{row.subject}</td>
+                          <td className="p-2">{row.score}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <button
+                  type="button"
+                  disabled={isImporting}
+                  onClick={handleImportExcel}
+                  className="w-full py-3 bg-green-600 text-white rounded-lg font-bold flex items-center justify-center gap-2 hover:bg-green-700 disabled:bg-slate-400 transition-all"
+                >
+                  <Upload size={18} />
+                  {isImporting ? 'Importing...' : `Import ${excelRows.length} Rows`}
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Marks History Table */}
